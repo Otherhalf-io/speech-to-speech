@@ -135,19 +135,45 @@ async def test_shared_inference_admission_is_bounded_across_streams() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_inference_queue_fails_without_starting_extra_work() -> None:
+async def test_full_stream_capacity_rejects_only_new_sessions() -> None:
     model = _FakeQwen(delay=0.05)
-    engine = QwenVllmEngine(_settings(max_queued_calls=0), model_factory=lambda **_: model)
+    engine = QwenVllmEngine(_settings(max_queued_calls=1), model_factory=lambda **_: model)
     first, second = await engine.new_stream(), await engine.new_stream()
     audio = np.zeros(4000, dtype="<i2").tobytes()
 
     running = asyncio.create_task(first.push(audio))
     while not model.active:
         await asyncio.sleep(0)
-    with pytest.raises(QwenVllmAdmissionError, match="queue is full"):
-        await second.push(audio)
-    await running
+    waiting = asyncio.create_task(second.push(audio))
+    with pytest.raises(QwenVllmAdmissionError, match="stream capacity is full"):
+        await engine.new_stream()
+    await asyncio.gather(running, waiting)
+    assert [len(samples) for samples in model.audio[-2:]] == [4000, 4000]
     assert engine.health() == (True, "ok")
+    await first.close()
+    await first.close()
+    third = await engine.new_stream()
+    assert (await third.push(audio))[0].text == "4000 "
+    await second.close()
+    await third.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_stream_initialization_releases_capacity() -> None:
+    model = _FakeQwen()
+    engine = QwenVllmEngine(_settings(max_queued_calls=0), model_factory=lambda **_: model)
+    await engine.start()
+    original = model.init_streaming_state
+
+    def fail_once(**kwargs: Any) -> _State:
+        model.init_streaming_state = original
+        raise ValueError("bad stream state")
+
+    model.init_streaming_state = fail_once
+    with pytest.raises(ValueError, match="bad stream state"):
+        await engine.new_stream()
+    recovered = await engine.new_stream()
+    await recovered.close()
 
 
 @pytest.mark.asyncio

@@ -42,8 +42,13 @@ async def transcribe_one_stream(pcm16_chunk: bytes):
 
 One stream is not concurrently writable. `QwenVllmEngine` serializes model
 calls when `max_concurrency=1`; increasing it requires backend-specific
-validation. A cancelled in-flight call retains its admission slot until the
-underlying blocking call drains. If a call exceeds its segment-scaled deadline,
-`health()` becomes false and subsequent calls fail explicitly; a hosting service
-should restart that process. Queue saturation raises `QwenVllmAdmissionError`.
+validation. At most `max_concurrency + max_queued_calls` streams may be open;
+`new_stream()` raises `QwenVllmAdmissionError` before admitting another one.
+Once admitted, a stream retains its place through its subsequent `push()` and
+`commit()` calls, so temporary contention cannot evict it mid-utterance. The
+caller must close every stream to release that reservation. A cancelled
+in-flight call retains its inference slot until the underlying blocking call
+drains. If a call exceeds its segment-scaled deadline, `health()` becomes false
+and subsequent calls fail explicitly; a hosting service should restart that
+process.
 No fallback to whole-WAV transcription is performed.

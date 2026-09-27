@@ -19,7 +19,7 @@ class QwenVllmUnhealthyError(RuntimeError):
 
 
 class QwenVllmAdmissionError(RuntimeError):
-    """The bounded inference queue is full."""
+    """The bounded stream capacity is full before a session starts."""
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,10 @@ class QwenVllmEngine:
         self._warmed = False
         self._load_lock = asyncio.Lock()
         self._admission = asyncio.Semaphore(settings.max_concurrency)
-        self._waiting = 0
+        # A stream has at most one inference call in flight. Reserving slots
+        # here bounds the inference queue without evicting an established stream.
+        self._active_streams = 0
+        self._max_active_streams = settings.max_concurrency + settings.max_queued_calls
         self._poison_reason: str | None = None
         self._drainers: set[asyncio.Task[None]] = set()
 
@@ -137,8 +140,20 @@ class QwenVllmEngine:
             self._warmed = True
 
     async def new_stream(self) -> QwenVllmStream:
-        await self.start()
-        return QwenVllmStream(self, await self._new_state())
+        if self._active_streams >= self._max_active_streams:
+            raise QwenVllmAdmissionError("Qwen stream capacity is full")
+        self._active_streams += 1
+        try:
+            await self.start()
+            return QwenVllmStream(self, await self._new_state())
+        except BaseException:
+            self._release_stream()
+            raise
+
+    def _release_stream(self) -> None:
+        if self._active_streams <= 0:
+            raise RuntimeError("Qwen stream admission released more than once")
+        self._active_streams -= 1
 
     async def _new_state(self) -> Any:
         return await self._call(
@@ -177,13 +192,7 @@ class QwenVllmEngine:
     ) -> Any:
         if self._poison_reason:
             raise QwenVllmUnhealthyError(self._poison_reason)
-        if self._admission.locked() and self._waiting >= self.settings.max_queued_calls:
-            raise QwenVllmAdmissionError("Qwen inference queue is full")
-        self._waiting += 1
-        try:
-            await self._admission.acquire()
-        finally:
-            self._waiting -= 1
+        await self._admission.acquire()
         release_here = True
         try:
             if self._poison_reason:
@@ -269,8 +278,12 @@ class QwenVllmStream:
             return updates
 
     async def close(self) -> None:
-        self._closed = True
-        self._pending.clear()
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._pending.clear()
+            self._engine._release_stream()
 
     async def _advance_pending(self) -> list[TranscriptUpdate]:
         pcm = bytes(self._pending)
